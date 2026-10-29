@@ -1,0 +1,29 @@
+{
+  "model_name": "APAAR Student Lifestyle Anomaly Detector",
+  "version": "1.0.0",
+  "algorithm": "sklearn.ensemble.IsolationForest",
+  "is_trained": true,
+  "trained_at": "2026-10-29T17:26:58.750927",
+  "training_records": 15377,
+  "test_records": 3845,
+  "training_dataset": "golden data.csv",
+  "features": [
+    "study_hours_per_day",
+    "sleep_hours",
+    "gaming_hours",
+    "social_media_hours",
+    "attendance_percentage",
+    "stress_level",
+    "focus_score",
+    "Previous_Grades"
+  ],
+  "metrics": {
+    "contamination_parameter": 0.08,
+    "test_anomaly_ratio": 0.0801,
+    "test_score_mean": 0.0396,
+    "test_score_min": -0.056,
+    "test_score_max": 0.1086,
+    "threshold": 0.0
+  },
+  "status_message": "Operational - Trained on official golden data.csv"
+}
