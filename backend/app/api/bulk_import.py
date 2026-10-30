@@ -1,7 +1,7 @@
 """
 Bulk Import API — Two-phase workflow
-  Phase 1: POST /analyze    — parse, validate, dedup, ML; return analysis; save CSV to disk
-  Phase 2: POST /confirm    — store approved records in DB; no re-parsing needed
+  Phase 1: POST /analyze    — parse, safe corrections, validate, dedup, intake check, ML; return analysis; save CSV to disk
+  Phase 2: POST /confirm    — store approved records in DB; generate credentials; log audit
   Extra:   DELETE /{id}/source-file — delete uploaded CSV (not DB records)
            GET /batches             — batch history
            GET /template            — download CSV template
@@ -21,7 +21,7 @@ from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models.entities import Student, Institution, DuplicateCase, Alert, User, ImportBatch
+from app.models.entities import Student, Institution, DuplicateCase, Alert, User, ImportBatch, CredentialRecord
 from app.schemas.schemas import (
     BatchAnalysisResponse, AnalyzedRecord, CorrectionItem,
     ConfirmImportRequest, ConfirmImportResponse,
@@ -32,13 +32,13 @@ from app.api.students import student_to_response
 from app.security.auth import get_current_user
 from app.security.rbac import require_roles
 from app.services.validation_service import validation_service
-from app.services.duplicate_service import duplicate_service
+from app.services.duplicate_service import duplicate_service, DuplicateCheckResult
 from app.services.ml_service import ml_service
+from app.services.pipeline_service import pipeline_service
 from app.services.audit_service import log_audit
 
 router = APIRouter(prefix="/bulk-import", tags=["Bulk Import"])
 
-# Directory where uploaded CSVs are temporarily stored
 UPLOAD_DIR = Path(__file__).parent.parent.parent / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
@@ -46,23 +46,12 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _safe_str(val: Any) -> str:
-    """Convert a pandas cell value to string safely."""
     if pd.isna(val) if not isinstance(val, str) else False:
         return ""
     return str(val)
 
 
 def apply_safe_corrections(row_dict: Dict[str, Any]) -> tuple[Dict[str, Any], List[CorrectionItem]]:
-    """
-    Apply ONLY deterministic, identity-preserving corrections:
-      • Trim leading/trailing whitespace from all string fields
-      • Uppercase APAAR ID (cosmetic normalisation)
-      • Uppercase certificate_number (cosmetic normalisation)
-      • Lowercase email (RFC 5321 local-part is case-insensitive in practice)
-
-    Never: invent missing values, guess IDs, modify academic data.
-    Every change is recorded for audit.
-    """
     corrected = dict(row_dict)
     corrections: List[CorrectionItem] = []
 
@@ -71,6 +60,7 @@ def apply_safe_corrections(row_dict: Dict[str, Any]) -> tuple[Dict[str, Any], Li
         "gender", "date_of_birth", "degree_program", "department",
         "academic_year", "current_semester", "admission_date",
         "certificate_number", "certificate_issue_date",
+        "admission_category", "nri_status", "oci_status", "foreign_national_status"
     ]
 
     for field in string_fields:
@@ -81,6 +71,8 @@ def apply_safe_corrections(row_dict: Dict[str, Any]) -> tuple[Dict[str, Any], Li
             final = trimmed.upper()
         elif field == "email":
             final = trimmed.lower()
+        elif field in ("nri_status", "oci_status", "foreign_national_status"):
+            final = trimmed.capitalize()
         else:
             final = trimmed
 
@@ -109,7 +101,6 @@ def _check_batch_duplicate(
     seen: Dict[str, Dict[str, int]],
     row_num: int
 ) -> tuple[bool, Optional[str]]:
-    """Check if this row duplicates another row already seen in the same batch."""
     checks = [
         ("apaar_id", "APAAR ID"),
         ("student_id", "Student ID"),
@@ -131,15 +122,6 @@ def _register_seen(row_dict: Dict[str, Any], seen: Dict[str, Dict[str, int]], ro
             seen.setdefault(key, {})[val] = row_num
 
 
-def _default_include(rec: "AnalyzedRecord") -> bool:
-    """Default: include valid, non-DB-duplicate records. Batch duplicates also default-excluded."""
-    if not rec.is_valid:
-        return False
-    if rec.is_duplicate_in_db or rec.is_duplicate_in_batch:
-        return False
-    return True
-
-
 # ─── Template ─────────────────────────────────────────────────────────────────
 
 @router.get("/template", response_class=PlainTextResponse)
@@ -147,13 +129,13 @@ def get_template():
     return (
         "apaar_id,student_id,full_name,email,phone,gender,date_of_birth,"
         "degree_program,department,academic_year,current_semester,"
-        "admission_date,cgpa,last_semester_gpa,attendance_percentage,"
+        "admission_date,admission_category,nri_status,oci_status,foreign_national_status,supernumerary_quota,"
+        "cgpa,last_semester_gpa,attendance_percentage,"
         "study_hours_per_day,sleep_hours,gaming_hours,"
         "certificate_number,certificate_issue_date\n"
-        "APAAR-2026-9001,REG-2026-9001,Aarav Patel,aarav.patel@example.edu,"
-        "+919876543210,Male,2003-08-14,"
-        "B.Tech Computer Science,Computer Science,2025-2026,6th,"
-        "2022-08-01,3.82,3.85,92.0,6.5,7.0,1.0,"
+        "APAAR-2026-9001,REG-2026-9001,Aarav Patel,aarav.patel@example.edu,+919876543210,Male,2003-08-14,"
+        "B.Tech Computer Science and Engineering,Computer Science,2025-2026,6th,"
+        "2022-08-01,General,No,No,No,None,3.82,3.85,92.0,6.5,7.0,1.0,"
         "CERT-2026-90010,2022-08-15\n"
     )
 
@@ -165,8 +147,12 @@ def get_batch_history(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    query = db.query(ImportBatch)
+    if current_user.role in ("COLLEGE_ADMIN", "ADMISSION_STAFF") and current_user.institution_id:
+        query = query.filter(ImportBatch.institution_id == current_user.institution_id)
+        
     batches = (
-        db.query(ImportBatch)
+        query
         .order_by(ImportBatch.created_at.desc())
         .limit(50)
         .all()
@@ -184,13 +170,13 @@ async def analyze_bulk_file(
     db: Session = Depends(get_db)
 ):
     """
-    Phase 1 — Parse → Safe-correct → Validate → Detect duplicates → Run ML.
+    Phase 1 — Parse → Safe-correct → Validate → Detect duplicates & cross-institution collisions → Check intake limits → Run ML.
     Saves the uploaded CSV to disk and analysis results to DB.
     Does NOT store student records yet.
     """
     target_inst_id = (
         current_user.institution_id
-        if current_user.role == "COLLEGE_ADMIN"
+        if current_user.role in ("COLLEGE_ADMIN", "ADMISSION_STAFF")
         else (institution_id or 1)
     )
     inst = db.query(Institution).filter(Institution.id == target_inst_id).first()
@@ -230,6 +216,7 @@ async def analyze_bulk_file(
     # Create batch record (status=ANALYZING)
     batch = ImportBatch(
         batch_id=batch_id,
+        submission_method="CSV",
         filename=filename,
         source_file_path=str(dest_path),
         uploaded_by=current_user.email,
@@ -245,17 +232,17 @@ async def analyze_bulk_file(
 
     # ── Per-row analysis ─────────────────────────────────────────────────────
     analyzed_records: List[AnalyzedRecord] = []
-    seen: Dict[str, Dict[str, int]] = {}  # tracks values seen so far in this batch
+    seen: Dict[str, Dict[str, int]] = {}
 
     counters = dict(
-        valid=0, issues=0, dups=0, anomalies=0, suspicious=0,
-        genuine=0, corrections=0, manual_review=0
+        valid=0, issues=0, dups=0, cross_dups=0, excess_intake=0,
+        anomalies=0, suspicious=0, genuine=0, corrections=0, manual_review=0
     )
 
     for idx, row in df.iterrows():
-        row_num = int(idx) + 2  # header = row 1
+        row_num = int(idx) + 2
 
-        # 1. Raw row dict — convert NaN → ""
+        # 1. Raw row dict
         raw = {k: ("" if (not isinstance(v, str) and pd.isna(v)) else v)
                for k, v in row.to_dict().items()}
         raw["institution_id"] = target_inst_id
@@ -283,16 +270,32 @@ async def analyze_bulk_file(
         is_dup_batch, batch_dup_reason = _check_batch_duplicate(corrected, seen, row_num)
         _register_seen(corrected, seen, row_num)
 
-        # 6. DB duplicate check (only if valid and not already batch-dup)
+        # 6. DB duplicate check & cross-institution detection
         is_dup_db = False
         db_dup_match_id = None
         db_dup_reason = None
+        is_cross_inst = False
+
         if is_valid and not is_dup_batch:
-            is_dup_db, db_dup_match_id, db_dup_reason = duplicate_service.check_duplicate(db, corrected)
+            dup_res: DuplicateCheckResult = duplicate_service.check_duplicate(db, corrected)
+            is_dup_db = dup_res.is_duplicate
+            db_dup_match_id = dup_res.match_id
+            db_dup_reason = dup_res.reason
+            is_cross_inst = dup_res.is_cross_institution
 
         is_any_dup = is_dup_db or is_dup_batch
 
-        # 7. ML inference (even for duplicates — they still have a statistical profile)
+        # 7. Intake Capacity Check
+        prog_name = str(corrected.get("degree_program", "")).strip()
+        acad_year = str(corrected.get("academic_year", "2025-2026")).strip()
+        intake_info = pipeline_service.check_intake_limit(db, target_inst_id, prog_name, acad_year)
+        is_excess = intake_info.get("is_excess", False)
+        intake_warn = None
+        if is_excess:
+            counters["excess_intake"] += 1
+            intake_warn = f"Intake capacity exceeded! Approved: {intake_info['approved_intake']}, Enrolled: {intake_info['current_enrolment'] + 1}."
+
+        # 8. ML inference
         anom_status = "NOT_RUN"
         anom_score = None
         anom_reason = None
@@ -304,32 +307,35 @@ async def analyze_bulk_file(
             anom_status, anom_score, anom_reason = ml_service.run_isolation_forest_inference(corrected)
             ml_class, ml_conf, ml_reason = ml_service.run_random_forest_inference(corrected)
 
-        # 8. Overall risk
+        # 9. Overall risk
         overall_risk = ml_service.calculate_overall_risk(
             "VALID" if is_valid else "INVALID",
             "DUPLICATE_FLAGGED" if is_any_dup else "UNIQUE",
             anom_status if anom_status != "NOT_RUN" else "NORMAL",
             ml_class if ml_class != "NOT_RUN" else "GENUINE",
         )
+        if is_cross_inst or is_excess:
+            overall_risk = "HIGH" if overall_risk in ("LOW", "MEDIUM") else overall_risk
 
-        # 9. Update counters
+        # 10. Update counters
         if is_valid and not is_any_dup:
             counters["valid"] += 1
         if not is_valid:
             counters["issues"] += 1
         if is_any_dup:
             counters["dups"] += 1
+        if is_cross_inst:
+            counters["cross_dups"] += 1
         if anom_status == "ANOMALOUS":
             counters["anomalies"] += 1
         if ml_class == "SUSPICIOUS":
             counters["suspicious"] += 1
         if ml_class == "GENUINE" and anom_status == "NORMAL":
             counters["genuine"] += 1
-        if anom_status == "ANOMALOUS" or ml_class == "SUSPICIOUS":
+        if anom_status == "ANOMALOUS" or ml_class == "SUSPICIOUS" or is_cross_inst or is_excess:
             counters["manual_review"] += 1
 
-        # 10. Default include flag
-        include = is_valid and not is_any_dup  # anomalies/suspicious still included by default
+        include = is_valid and not is_any_dup
 
         rec = AnalyzedRecord(
             row=row_num,
@@ -340,8 +346,11 @@ async def analyze_bulk_file(
             is_valid=is_valid,
             is_duplicate_in_db=is_dup_db,
             is_duplicate_in_batch=is_dup_batch,
+            is_cross_institution=is_cross_inst,
             duplicate_reason=db_dup_reason or batch_dup_reason,
             duplicate_match_id=db_dup_match_id,
+            is_excess_intake=is_excess,
+            intake_warning=intake_warn,
             anomaly_status=anom_status,
             anomaly_score=round(anom_score, 4) if anom_score is not None else None,
             anomaly_reason=anom_reason,
@@ -357,6 +366,8 @@ async def analyze_bulk_file(
     batch.valid_records = counters["valid"]
     batch.validation_issues_count = counters["issues"]
     batch.duplicate_count = counters["dups"]
+    batch.cross_institution_duplicate_count = counters["cross_dups"]
+    batch.excess_intake_count = counters["excess_intake"]
     batch.anomaly_count = counters["anomalies"]
     batch.suspicious_count = counters["suspicious"]
     batch.genuine_count = counters["genuine"]
@@ -366,7 +377,6 @@ async def analyze_bulk_file(
     batch.processing_timestamp = datetime.datetime.utcnow()
     batch.updated_at = datetime.datetime.utcnow()
 
-    # Serialise analysis for confirm phase (avoids re-parsing CSV)
     batch.analysis_data_json = json.dumps([r.model_dump() for r in analyzed_records])
 
     db.commit()
@@ -380,9 +390,8 @@ async def analyze_bulk_file(
         entity_id=batch_id,
         details=(
             f"Analyzed '{filename}'. Total: {len(df)}, Valid: {counters['valid']}, "
-            f"Issues: {counters['issues']}, Dups: {counters['dups']}, "
-            f"Anomalies: {counters['anomalies']}, Suspicious: {counters['suspicious']}, "
-            f"Corrections: {counters['corrections']}"
+            f"Issues: {counters['issues']}, Dups: {counters['dups']}, Cross-Dups: {counters['cross_dups']}, "
+            f"Excess: {counters['excess_intake']}, Anomalies: {counters['anomalies']}, Corrections: {counters['corrections']}"
         )
     )
 
@@ -393,6 +402,8 @@ async def analyze_bulk_file(
         valid_records=counters["valid"],
         validation_issues=counters["issues"],
         duplicate_count=counters["dups"],
+        cross_institution_duplicate_count=counters["cross_dups"],
+        excess_intake_count=counters["excess_intake"],
         anomaly_count=counters["anomalies"],
         suspicious_count=counters["suspicious"],
         auto_corrections_count=counters["corrections"],
@@ -412,8 +423,8 @@ def confirm_import(
 ):
     """
     Phase 2 — Store approved records in the database.
-    Applies safe corrections. Never modifies identity data based on ML.
-    Excluded rows (user-unchecked) are skipped.
+    Applies approved safe corrections, generates verifiable credentials,
+    preserves analysis metadata, and updates real-time dashboard states.
     """
     batch = db.query(ImportBatch).filter(ImportBatch.batch_id == batch_id).first()
     if not batch:
@@ -432,24 +443,17 @@ def confirm_import(
     for rec_dict in records_raw:
         row_num = rec_dict["row"]
 
-        # Skip records the user excluded
         if row_num in excluded_rows:
             skipped += 1
             continue
 
-        # Skip invalid records unless user explicitly included them (they should not be)
         if not rec_dict["is_valid"]:
             skipped += 1
             continue
 
-        # Skip records pre-excluded by default (DB duplicates, batch duplicates)
-        # UNLESS the user explicitly KEPT them (i.e., their row is NOT in excluded_rows)
-        # The include_in_import flag was set during analysis — if user kept a dup, import it
-
         corrected = rec_dict["corrected_data"]
         corrected["institution_id"] = batch.institution_id or 1
 
-        # Re-coerce numerics (stored as strings in JSON)
         for num_field, default in [
             ("cgpa", 0.0), ("last_semester_gpa", 0.0),
             ("attendance_percentage", 0.0), ("study_hours_per_day", 4.0),
@@ -460,8 +464,13 @@ def confirm_import(
             except (ValueError, TypeError):
                 corrected[num_field] = default
 
-        # Duplicate check again (another batch may have been confirmed since analysis)
-        is_dup, match_id, dup_reason = duplicate_service.check_duplicate(db, corrected)
+        dup_res: DuplicateCheckResult = duplicate_service.check_duplicate(db, corrected)
+        is_dup = dup_res.is_duplicate
+        match_id = dup_res.match_id
+        dup_reason = dup_res.reason
+        is_cross_inst = dup_res.is_cross_institution
+
+        v_code = f"VER-APAAR-{uuid.uuid4().hex[:10].upper()}"
 
         new_student = Student(
             apaar_id=str(corrected.get("apaar_id", "")).strip().upper(),
@@ -477,6 +486,13 @@ def confirm_import(
             academic_year=str(corrected.get("academic_year", "2025-2026")),
             current_semester=str(corrected.get("current_semester", "1st")),
             admission_date=str(corrected.get("admission_date", "2023-08-01")),
+            admission_category=str(corrected.get("admission_category", "General")),
+            nri_status=str(corrected.get("nri_status", "No")),
+            oci_status=str(corrected.get("oci_status", "No")),
+            foreign_national_status=str(corrected.get("foreign_national_status", "No")),
+            supernumerary_quota=str(corrected.get("supernumerary_quota", "None")),
+            submission_source="CSV_IMPORT",
+            submission_batch_id=batch_id,
             cgpa=corrected["cgpa"],
             last_semester_gpa=corrected["last_semester_gpa"],
             attendance_percentage=corrected["attendance_percentage"],
@@ -485,14 +501,13 @@ def confirm_import(
             gaming_hours=corrected["gaming_hours"],
             certificate_number=str(corrected.get("certificate_number", "")).strip().upper(),
             certificate_issue_date=str(corrected.get("certificate_issue_date", "2023-07-20")),
-            # Validation results from analysis
             validation_status="VALID",
             validation_errors_json="[]",
-            # Duplicate results
             duplicate_status="DUPLICATE_FLAGGED" if is_dup else "UNIQUE",
             duplicate_match_id=match_id,
             duplicate_reason=dup_reason,
-            # ML results from analysis
+            is_cross_institution_duplicate=is_cross_inst,
+            is_excess_intake=bool(rec_dict.get("is_excess_intake", False)),
             anomaly_status=rec_dict.get("anomaly_status", "NOT_EVALUATED"),
             anomaly_score=rec_dict.get("anomaly_score"),
             anomaly_reason=rec_dict.get("anomaly_reason"),
@@ -501,32 +516,59 @@ def confirm_import(
             ml_reason=rec_dict.get("ml_reason"),
             overall_risk_level=rec_dict.get("overall_risk", "LOW"),
             verification_status="PENDING",
+            verification_code=v_code,
             created_at=datetime.datetime.utcnow(),
             updated_at=datetime.datetime.utcnow(),
         )
         db.add(new_student)
         db.flush()
 
+        # Add Credential Record
+        db.add(CredentialRecord(
+            student_id=new_student.id,
+            credential_id=f"CRED-APAAR-{new_student.id}-{uuid.uuid4().hex[:6].upper()}",
+            verification_code=v_code,
+            certificate_number=new_student.certificate_number,
+            status="ACTIVE",
+            qr_payload=f"https://apaar.aicte-india.org/verify?apaar={new_student.apaar_id}&code={v_code}",
+            issued_at=datetime.datetime.utcnow(),
+            issued_by=current_user.email
+        ))
+
         # Store duplicate case if flagged
-        if is_dup and match_id:
+        if is_dup:
             db.add(DuplicateCase(
                 student_id=new_student.id,
                 matched_student_id=match_id,
                 reason=dup_reason or "Duplicate detected at confirmation time.",
+                is_cross_institution=is_cross_inst,
+                matched_institution_id=dup_res.matched_institution_id,
                 created_at=datetime.datetime.utcnow()
             ))
+            alert_type = "CROSS_INSTITUTION_DUPLICATE" if is_cross_inst else "DUPLICATE_DETECTED"
             db.add(Alert(
                 student_id=new_student.id,
-                alert_type="DUPLICATE_DETECTED",
+                institution_id=new_student.institution_id,
+                alert_type=alert_type,
                 severity="CRITICAL",
-                reason=dup_reason or "Duplicate detected during bulk import confirmation.",
+                reason=dup_reason or "Duplicate conflict detected during bulk import confirmation.",
                 status="NEW"
             ))
 
-        # Alerts for anomalies/suspicious (not auto-modified, just alerted)
+        if new_student.is_excess_intake:
+            db.add(Alert(
+                student_id=new_student.id,
+                institution_id=new_student.institution_id,
+                alert_type="EXCESS_ENROLMENT",
+                severity="CRITICAL",
+                reason=f"Admissions exceed approved intake quota for program '{new_student.degree_program}'.",
+                status="NEW"
+            ))
+
         if rec_dict.get("anomaly_status") == "ANOMALOUS":
             db.add(Alert(
                 student_id=new_student.id,
+                institution_id=new_student.institution_id,
                 alert_type="ISOLATION_FOREST_ANOMALY",
                 severity="WARNING",
                 reason=rec_dict.get("anomaly_reason") or "Statistical outlier detected during bulk import.",
@@ -536,6 +578,7 @@ def confirm_import(
         if rec_dict.get("ml_classification") == "SUSPICIOUS":
             db.add(Alert(
                 student_id=new_student.id,
+                institution_id=new_student.institution_id,
                 alert_type="RANDOM_FOREST_SUSPICIOUS",
                 severity="CRITICAL",
                 reason=rec_dict.get("ml_reason") or "Supervised classifier flagged suspicious indicators.",
@@ -544,7 +587,6 @@ def confirm_import(
 
         imported += 1
 
-    # Mark batch complete
     batch.status = "COMPLETED"
     batch.imported_count = imported
     batch.updated_at = datetime.datetime.utcnow()
@@ -577,10 +619,6 @@ def delete_source_file(
     current_user: User = Depends(require_roles(["AICTE_ADMIN", "COLLEGE_ADMIN", "ADMISSION_STAFF"])),
     db: Session = Depends(get_db)
 ):
-    """
-    Delete the uploaded source CSV from disk.
-    DOES NOT delete imported student records, validation results, ML results, or audit data.
-    """
     batch = db.query(ImportBatch).filter(ImportBatch.batch_id == batch_id).first()
     if not batch:
         raise HTTPException(status_code=404, detail=f"Batch '{batch_id}' not found.")
@@ -589,11 +627,10 @@ def delete_source_file(
         return {"success": True, "message": "Source file was already deleted."}
 
     file_path = batch.source_file_path
+    deleted = False
     if file_path and os.path.exists(file_path):
         os.remove(file_path)
         deleted = True
-    else:
-        deleted = False  # file already gone from disk
 
     batch.file_deleted = True
     batch.source_file_path = None
@@ -607,10 +644,7 @@ def delete_source_file(
         action="BULK_IMPORT_SOURCE_DELETED",
         entity_type="ImportBatch",
         entity_id=batch_id,
-        details=(
-            f"Source CSV for batch '{batch_id}' ({batch.filename}) deleted from disk. "
-            f"Database records remain unaffected."
-        )
+        details=f"Source CSV for batch '{batch_id}' deleted from storage. Database records preserved."
     )
 
     return {

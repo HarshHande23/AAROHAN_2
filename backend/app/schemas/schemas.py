@@ -46,6 +46,35 @@ class InstitutionResponse(BaseModel):
     class Config:
         from_attributes = True
 
+# ─── Program Intake Schemas ───────────────────────────────────────────────────
+
+class InstitutionProgramIntakeBase(BaseModel):
+    program_name: str
+    academic_year: Optional[str] = "2025-2026"
+    approved_intake: int = 120
+    supernumerary_seats: int = 10
+    intake_policy: Optional[str] = "SUPERNUMERARY_EXCLUDED"
+
+class InstitutionProgramIntakeCreate(InstitutionProgramIntakeBase):
+    institution_id: int
+
+class InstitutionProgramIntakeResponse(InstitutionProgramIntakeBase):
+    id: int
+    institution_id: int
+    institution_name: Optional[str] = None
+    institution_code: Optional[str] = None
+    actual_enrolment: int = 0
+    excess_enrolment: int = 0
+    utilization_percentage: float = 0.0
+    intake_status: str = "WITHIN_LIMIT" # WITHIN_LIMIT | NEAR_CAPACITY | EXCESS_ENROLMENT
+    created_at: datetime.datetime
+    updated_at: datetime.datetime
+
+    class Config:
+        from_attributes = True
+
+# ─── Student Schemas ──────────────────────────────────────────────────────────
+
 class StudentBase(BaseModel):
     apaar_id: str
     student_id: str
@@ -60,9 +89,19 @@ class StudentBase(BaseModel):
     academic_year: Optional[str] = "2025-2026"
     current_semester: Optional[str] = "1st"
     admission_date: Optional[str] = "2023-08-01"
-    cgpa: float
-    last_semester_gpa: float
-    attendance_percentage: float
+    
+    # SIH Specific Categories & Quotas
+    admission_category: Optional[str] = "General"
+    nri_status: Optional[str] = "No"
+    oci_status: Optional[str] = "No"
+    foreign_national_status: Optional[str] = "No"
+    supernumerary_quota: Optional[str] = "None"
+    submission_source: Optional[str] = "MANUAL"
+    
+    # Indicators
+    cgpa: float = 0.0
+    last_semester_gpa: float = 0.0
+    attendance_percentage: float = 0.0
     study_hours_per_day: Optional[float] = 4.0
     sleep_hours: Optional[float] = 7.0
     gaming_hours: Optional[float] = 1.0
@@ -85,6 +124,11 @@ class StudentUpdate(BaseModel):
     degree_program: Optional[str] = None
     department: Optional[str] = None
     current_semester: Optional[str] = None
+    admission_category: Optional[str] = None
+    nri_status: Optional[str] = None
+    oci_status: Optional[str] = None
+    foreign_national_status: Optional[str] = None
+    supernumerary_quota: Optional[str] = None
 
 class StudentResponse(StudentBase):
     id: int
@@ -95,6 +139,8 @@ class StudentResponse(StudentBase):
     duplicate_status: str
     duplicate_match_id: Optional[int] = None
     duplicate_reason: Optional[str] = None
+    is_cross_institution_duplicate: bool = False
+    is_excess_intake: bool = False
     anomaly_status: str
     anomaly_score: Optional[float] = None
     anomaly_reason: Optional[str] = None
@@ -106,6 +152,7 @@ class StudentResponse(StudentBase):
     verified_at: Optional[datetime.datetime] = None
     verified_by: Optional[str] = None
     verification_notes: Optional[str] = None
+    verification_code: Optional[str] = None
     created_at: datetime.datetime
     updated_at: datetime.datetime
 
@@ -123,19 +170,60 @@ class VerifyStudentRequest(BaseModel):
     status: str # VERIFIED, REJECTED, FLAGGED
     notes: Optional[str] = None
 
+# ─── Credential Schemas ───────────────────────────────────────────────────────
+
+class CredentialResponse(BaseModel):
+    credential_id: str
+    verification_code: str
+    student_id: int
+    apaar_id: str
+    student_name: str
+    institution_name: str
+    institution_code: str
+    degree_program: str
+    academic_year: str
+    certificate_number: str
+    certificate_issue_date: str
+    status: str
+    qr_payload: str
+    issued_at: datetime.datetime
+
+# ─── Public Verification Schemas ──────────────────────────────────────────────
+
+class PublicVerificationRequest(BaseModel):
+    identifier: str # APAAR ID, Student ID, or Certificate Number
+
+class PublicVerificationResponse(BaseModel):
+    verified: bool
+    apaar_id: Optional[str] = None
+    student_id: Optional[str] = None
+    student_name: Optional[str] = None
+    institution_name: Optional[str] = None
+    degree_program: Optional[str] = None
+    academic_year: Optional[str] = None
+    certificate_number: Optional[str] = None
+    certificate_issue_date: Optional[str] = None
+    verification_status: Optional[str] = None
+    verification_code: Optional[str] = None
+    message: str
+
+# ─── Duplicate & Alert Schemas ────────────────────────────────────────────────
+
 class DuplicateCaseResponse(BaseModel):
     id: int
     student: StudentResponse
     matched_student: Optional[StudentResponse] = None
     reason: str
+    is_cross_institution: bool = False
     created_at: datetime.datetime
 
 class AlertResponse(BaseModel):
     id: int
-    student_id: int
-    student_name: str
-    apaar_id: str
-    institution_name: str
+    student_id: Optional[int] = None
+    student_name: Optional[str] = None
+    apaar_id: Optional[str] = None
+    institution_id: Optional[int] = None
+    institution_name: Optional[str] = None
     alert_type: str
     severity: str
     reason: str
@@ -174,31 +262,50 @@ class MLModelStatusResponse(BaseModel):
     metrics: Optional[Dict[str, Any]] = None
     status_message: str
 
+# ─── Dashboard Schemas ────────────────────────────────────────────────────────
+
+class InstitutionIntakeBreakdownItem(BaseModel):
+    institution_id: int
+    institution_name: str
+    institution_code: str
+    total_programs: int
+    approved_intake: int
+    actual_enrolment: int
+    excess_enrolment: int
+    utilization_percentage: float
+
 class DashboardResponse(BaseModel):
     total_students: int
     total_institutions: int
+    total_approved_intake: int = 0
+    total_actual_enrolment: int = 0
+    total_excess_enrolment: int = 0
+    intake_utilization_percentage: float = 0.0
     records_validated: int
     records_requiring_review: int
     duplicate_cases: int
+    cross_institution_duplicates: int = 0
     anomalies_detected: int
     suspicious_records: int
     genuine_records: int
     pending_verification: int
+    verified_records: int = 0
     active_alerts: int
     bulk_import_total: int
     program_distribution: Dict[str, int]
     risk_distribution: Dict[str, int]
     verification_distribution: Dict[str, int]
+    institution_intake_breakdown: List[InstitutionIntakeBreakdownItem] = []
     recent_students: List[StudentResponse]
     recent_audit_logs: List[AuditLogResponse]
+
+# ─── Ingestion & Submission Schemas ───────────────────────────────────────────
 
 class BulkImportErrorItem(BaseModel):
     row: int
     field: str
     value: Optional[str] = None
     reason: str
-
-# ─── New two-phase bulk import schemas ────────────────────────────────────────
 
 class CorrectionItem(BaseModel):
     field: str
@@ -215,8 +322,11 @@ class AnalyzedRecord(BaseModel):
     is_valid: bool
     is_duplicate_in_db: bool
     is_duplicate_in_batch: bool
+    is_cross_institution: bool = False
     duplicate_reason: Optional[str] = None
     duplicate_match_id: Optional[int] = None
+    is_excess_intake: bool = False
+    intake_warning: Optional[str] = None
     anomaly_status: str   # NORMAL | ANOMALOUS | NOT_RUN
     anomaly_score: Optional[float] = None
     anomaly_reason: Optional[str] = None
@@ -224,7 +334,7 @@ class AnalyzedRecord(BaseModel):
     ml_confidence: Optional[float] = None
     ml_reason: Optional[str] = None
     overall_risk: str   # LOW | MEDIUM | HIGH | CRITICAL
-    include_in_import: bool  # user-toggleable; pre-set by analysis
+    include_in_import: bool
 
 class BatchAnalysisResponse(BaseModel):
     batch_id: str
@@ -233,6 +343,8 @@ class BatchAnalysisResponse(BaseModel):
     valid_records: int
     validation_issues: int
     duplicate_count: int
+    cross_institution_duplicate_count: int = 0
+    excess_intake_count: int = 0
     anomaly_count: int
     suspicious_count: int
     auto_corrections_count: int
@@ -240,7 +352,7 @@ class BatchAnalysisResponse(BaseModel):
     records: List[AnalyzedRecord]
 
 class ConfirmImportRequest(BaseModel):
-    excluded_rows: List[int] = []   # row numbers the user wants to skip
+    excluded_rows: List[int] = []
 
 class ConfirmImportResponse(BaseModel):
     batch_id: str
@@ -252,6 +364,7 @@ class ConfirmImportResponse(BaseModel):
 class BatchSummaryResponse(BaseModel):
     id: int
     batch_id: str
+    submission_method: str = "CSV"
     filename: str
     uploaded_by: str
     uploaded_by_role: str
@@ -262,6 +375,8 @@ class BatchSummaryResponse(BaseModel):
     valid_records: int
     validation_issues_count: int
     duplicate_count: int
+    cross_institution_duplicate_count: int = 0
+    excess_intake_count: int = 0
     anomaly_count: int
     suspicious_count: int
     imported_count: int
@@ -269,8 +384,6 @@ class BatchSummaryResponse(BaseModel):
 
     class Config:
         from_attributes = True
-
-# ─── Legacy single-phase schema (kept for backward compat) ────────────────────
 
 class BulkImportResponseSchema(BaseModel):
     import_id: str
@@ -284,14 +397,73 @@ class BulkImportResponseSchema(BaseModel):
     errors: List[BulkImportErrorItem]
     imported_students: List[StudentResponse]
 
+# ─── API Integration Submission Schemas ───────────────────────────────────────
+
+class ApiStudentRecordPayload(BaseModel):
+    apaar_id: str
+    student_id: str
+    full_name: str
+    email: str
+    phone: Optional[str] = None
+    gender: Optional[str] = "Other"
+    date_of_birth: Optional[str] = "2000-01-01"
+    institution_id: Optional[int] = None
+    degree_program: str
+    department: Optional[str] = None
+    academic_year: Optional[str] = "2025-2026"
+    current_semester: Optional[str] = "1st"
+    admission_date: Optional[str] = "2023-08-01"
+    admission_category: Optional[str] = "General"
+    nri_status: Optional[str] = "No"
+    oci_status: Optional[str] = "No"
+    foreign_national_status: Optional[str] = "No"
+    supernumerary_quota: Optional[str] = "None"
+    cgpa: float = 0.0
+    last_semester_gpa: float = 0.0
+    attendance_percentage: float = 0.0
+    certificate_number: str
+    certificate_issue_date: Optional[str] = "2023-07-20"
+
+class ApiBatchSubmissionRequest(BaseModel):
+    records: List[ApiStudentRecordPayload]
+
+class ApiSubmissionResponse(BaseModel):
+    success: bool
+    batch_id: str
+    total_submitted: int
+    accepted: int
+    rejected: int
+    duplicates_flagged: int
+    cross_institution_duplicates: int
+    excess_intake_flagged: int
+    anomalies_detected: int
+    records: List[Dict[str, Any]]
+    message: str
+
+# ─── Compliance Report Schemas ────────────────────────────────────────────────
+
+class IntakeComplianceItem(BaseModel):
+    institution_id: int
+    institution_name: str
+    program_name: str
+    academic_year: str
+    approved_intake: int
+    supernumerary_seats: int
+    actual_enrolment: int
+    excess_enrolment: int
+    status: str # NORMAL | EXCESS
+
 class ComplianceReportResponse(BaseModel):
     generated_at: datetime.datetime
     filter_institution: Optional[str] = None
     total_enrolled: int
+    total_approved_intake: int
+    total_excess_enrolment: int
     valid_percentage: float
     duplicate_rate: float
+    cross_institution_duplicate_count: int
     anomaly_rate: float
     suspicious_rate: float
     verified_percentage: float
-    institution_breakdown: List[Dict[str, Any]]
-
+    intake_compliance: List[IntakeComplianceItem] = []
+    institution_breakdown: List[Dict[str, Any]] = []

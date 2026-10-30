@@ -80,7 +80,7 @@ export const StudentDetailPage: React.FC = () => {
         <h3 className="text-base font-bold text-slate-900">Record Not Found</h3>
         <p className="text-xs text-slate-500">{error || "The requested student record does not exist in the database."}</p>
         <Link
-          to="/students"
+          to="/app/students"
           className="inline-flex items-center gap-2 px-4 py-2 bg-blue-700 text-white rounded-lg text-xs font-semibold"
         >
           <ArrowLeft className="h-4 w-4" /> Back to Registry
@@ -97,7 +97,7 @@ export const StudentDetailPage: React.FC = () => {
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-3 border-b border-slate-200">
         <div className="flex items-center gap-3">
           <Link
-            to="/students"
+            to="/app/students"
             className="p-2 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-lg transition"
             title="Back to Students Registry"
           >

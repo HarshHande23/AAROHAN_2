@@ -4,6 +4,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 from sqlalchemy import or_, desc, asc
+
 from app.database import get_db
 from app.models.entities import Student, Institution, DuplicateCase, Alert, User
 from app.schemas.schemas import (
@@ -11,9 +12,7 @@ from app.schemas.schemas import (
 )
 from app.security.auth import get_current_user
 from app.security.rbac import require_roles
-from app.services.validation_service import validation_service
-from app.services.duplicate_service import duplicate_service
-from app.services.ml_service import ml_service
+from app.services.pipeline_service import pipeline_service, PipelineResult
 from app.services.audit_service import log_audit
 
 router = APIRouter(prefix="/students", tags=["Students"])
@@ -27,7 +26,7 @@ def student_to_response(student: Student) -> StudentResponse:
             val_errors = []
 
     inst_name = student.institution.name if student.institution else "Unknown Institution"
-    inst_code = student.institution.code if student.institution else "UNK"
+    inst_code = student.institution.code if student.institution else "AICTE"
 
     return StudentResponse(
         id=student.id,
@@ -36,16 +35,24 @@ def student_to_response(student: Student) -> StudentResponse:
         full_name=student.full_name,
         email=student.email,
         phone=student.phone,
-        gender=student.gender,
-        date_of_birth=student.date_of_birth,
+        gender=student.gender or "Other",
+        date_of_birth=student.date_of_birth or "2000-01-01",
         institution_id=student.institution_id,
         institution_name=inst_name,
         institution_code=inst_code,
         degree_program=student.degree_program,
         department=student.department,
-        academic_year=student.academic_year,
-        current_semester=student.current_semester,
-        admission_date=student.admission_date,
+        academic_year=student.academic_year or "2025-2026",
+        current_semester=student.current_semester or "1st",
+        admission_date=student.admission_date or "2023-08-01",
+        # SIH Specific Categories & Quotas
+        admission_category=student.admission_category or "General",
+        nri_status=student.nri_status or "No",
+        oci_status=student.oci_status or "No",
+        foreign_national_status=student.foreign_national_status or "No",
+        supernumerary_quota=student.supernumerary_quota or "None",
+        submission_source=student.submission_source or "MANUAL",
+        # Indicators
         cgpa=student.cgpa,
         last_semester_gpa=student.last_semester_gpa,
         attendance_percentage=student.attendance_percentage,
@@ -54,11 +61,15 @@ def student_to_response(student: Student) -> StudentResponse:
         gaming_hours=student.gaming_hours,
         certificate_number=student.certificate_number,
         certificate_issue_date=student.certificate_issue_date,
+        # Validation, Duplicates & Intake
         validation_status=student.validation_status,
         validation_errors=val_errors,
         duplicate_status=student.duplicate_status,
         duplicate_match_id=student.duplicate_match_id,
         duplicate_reason=student.duplicate_reason,
+        is_cross_institution_duplicate=bool(student.is_cross_institution_duplicate),
+        is_excess_intake=bool(student.is_excess_intake),
+        # ML
         anomaly_status=student.anomaly_status,
         anomaly_score=student.anomaly_score,
         anomaly_reason=student.anomaly_reason,
@@ -66,10 +77,12 @@ def student_to_response(student: Student) -> StudentResponse:
         ml_confidence=student.ml_confidence,
         ml_reason=student.ml_reason,
         overall_risk_level=student.overall_risk_level,
+        # Verification
         verification_status=student.verification_status,
         verified_at=student.verified_at,
         verified_by=student.verified_by,
         verification_notes=student.verification_notes,
+        verification_code=student.verification_code,
         created_at=student.created_at,
         updated_at=student.updated_at
     )
@@ -84,6 +97,9 @@ def get_students(
     anomaly_status: Optional[str] = None,
     ml_classification: Optional[str] = None,
     verification_status: Optional[str] = None,
+    admission_category: Optional[str] = None,
+    is_cross_institution_duplicate: Optional[bool] = None,
+    is_excess_intake: Optional[bool] = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
     sort_by: str = "id",
@@ -93,8 +109,8 @@ def get_students(
 ):
     query = db.query(Student)
 
-    # Institution scope boundary for College Admin
-    if current_user.role == "COLLEGE_ADMIN" and current_user.institution_id:
+    # Institution scope boundary for College Admin and Staff
+    if current_user.role in ("COLLEGE_ADMIN", "ADMISSION_STAFF") and current_user.institution_id:
         query = query.filter(Student.institution_id == current_user.institution_id)
     elif institution_id:
         query = query.filter(Student.institution_id == institution_id)
@@ -105,7 +121,8 @@ def get_students(
             Student.apaar_id.ilike(f"%{search}%"),
             Student.student_id.ilike(f"%{search}%"),
             Student.email.ilike(f"%{search}%"),
-            Student.certificate_number.ilike(f"%{search}%")
+            Student.certificate_number.ilike(f"%{search}%"),
+            Student.degree_program.ilike(f"%{search}%")
         )
         query = query.filter(search_filter)
 
@@ -121,6 +138,12 @@ def get_students(
         query = query.filter(Student.ml_classification == ml_classification)
     if verification_status:
         query = query.filter(Student.verification_status == verification_status)
+    if admission_category:
+        query = query.filter(Student.admission_category == admission_category)
+    if is_cross_institution_duplicate is not None:
+        query = query.filter(Student.is_cross_institution_duplicate == is_cross_institution_duplicate)
+    if is_excess_intake is not None:
+        query = query.filter(Student.is_excess_intake == is_excess_intake)
 
     total = query.count()
 
@@ -144,12 +167,16 @@ def get_students(
     )
 
 @router.get("/{id}", response_model=StudentResponse)
-def get_student_by_id(id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def get_student_by_id(
+    id: int, 
+    current_user: User = Depends(get_current_user), 
+    db: Session = Depends(get_db)
+):
     student = db.query(Student).filter(Student.id == id).first()
     if not student:
         raise HTTPException(status_code=404, detail="Student record not found.")
 
-    if current_user.role == "COLLEGE_ADMIN" and current_user.institution_id and student.institution_id != current_user.institution_id:
+    if current_user.role in ("COLLEGE_ADMIN", "ADMISSION_STAFF") and current_user.institution_id and student.institution_id != current_user.institution_id:
         raise HTTPException(status_code=403, detail="Unauthorized access to cross-institutional student record.")
 
     return student_to_response(student)
@@ -160,146 +187,41 @@ def create_student(
     current_user: User = Depends(require_roles(["AICTE_ADMIN", "COLLEGE_ADMIN", "ADMISSION_STAFF"])),
     db: Session = Depends(get_db)
 ):
-    student_dict = student_in.dict()
+    """
+    Direct single student enrolment. Feeds into the unified central pipeline service.
+    """
+    student_dict = student_in.model_dump()
 
     # College Admin can only enrol for their institution
-    if current_user.role == "COLLEGE_ADMIN" and current_user.institution_id:
+    if current_user.role in ("COLLEGE_ADMIN", "ADMISSION_STAFF") and current_user.institution_id:
         student_dict["institution_id"] = current_user.institution_id
 
-    # 1. Deterministic Validation Engine
-    is_valid, validation_errors = validation_service.validate_student_record(student_dict)
-    val_status = "VALID" if is_valid else "INVALID"
-
-    # 2. Deterministic Duplicate Detection
-    is_dup, match_id, dup_reason = duplicate_service.check_duplicate(db, student_dict)
-    dup_status = "DUPLICATE_FLAGGED" if is_dup else "UNIQUE"
-
-    # 3. Isolation Forest Anomaly Detection Inference
-    anom_status, anom_score, anom_reason = ml_service.run_isolation_forest_inference(student_dict)
-
-    # 4. Random Forest Supervised Classification Inference
-    ml_class, ml_conf, ml_reason = ml_service.run_random_forest_inference(student_dict)
-
-    # 5. Combined Overall Risk Level
-    overall_risk = ml_service.calculate_overall_risk(val_status, dup_status, anom_status, ml_class)
-
-    # Create Student Database Entity
-    new_student = Student(
-        apaar_id=student_dict["apaar_id"],
-        student_id=student_dict["student_id"],
-        full_name=student_dict["full_name"],
-        email=student_dict["email"],
-        phone=student_dict.get("phone"),
-        gender=student_dict.get("gender", "Other"),
-        date_of_birth=student_dict.get("date_of_birth", "2000-01-01"),
-        institution_id=student_dict["institution_id"],
-        degree_program=student_dict["degree_program"],
-        department=student_dict.get("department"),
-        academic_year=student_dict.get("academic_year", "2025-2026"),
-        current_semester=student_dict.get("current_semester", "1st"),
-        admission_date=student_dict.get("admission_date", "2023-08-01"),
-        cgpa=student_dict["cgpa"],
-        last_semester_gpa=student_dict["last_semester_gpa"],
-        attendance_percentage=student_dict["attendance_percentage"],
-        study_hours_per_day=student_dict.get("study_hours_per_day", 4.0),
-        sleep_hours=student_dict.get("sleep_hours", 7.0),
-        gaming_hours=student_dict.get("gaming_hours", 1.0),
-        certificate_number=student_dict["certificate_number"],
-        certificate_issue_date=student_dict.get("certificate_issue_date", "2023-07-20"),
-        validation_status=val_status,
-        validation_errors_json=json.dumps(validation_errors),
-        duplicate_status=dup_status,
-        duplicate_match_id=match_id,
-        duplicate_reason=dup_reason,
-        anomaly_status=anom_status,
-        anomaly_score=anom_score,
-        anomaly_reason=anom_reason,
-        ml_classification=ml_class,
-        ml_confidence=ml_conf,
-        ml_reason=ml_reason,
-        overall_risk_level=overall_risk,
-        verification_status="PENDING",
-        created_at=datetime.datetime.utcnow(),
-        updated_at=datetime.datetime.utcnow()
-    )
-
-    db.add(new_student)
-    db.commit()
-    db.refresh(new_student)
-
-    # 6. Automatic Alert Generation for actionable conditions
-    if is_dup:
-        db.add(DuplicateCase(
-            student_id=new_student.id,
-            matched_student_id=match_id,
-            reason=dup_reason or "Duplicate identifier conflict"
-        ))
-        db.add(Alert(
-            student_id=new_student.id,
-            alert_type="DUPLICATE_DETECTED",
-            severity="CRITICAL",
-            reason=dup_reason or "Duplicate record flagged by deterministic engine.",
-            status="NEW"
-        ))
-
-    if not is_valid:
-        db.add(Alert(
-            student_id=new_student.id,
-            alert_type="INVALID_IDENTIFIER" if any("APAAR" in e for e in validation_errors) else "ACADEMIC_INCONSISTENCY",
-            severity="WARNING",
-            reason="; ".join(validation_errors),
-            status="NEW"
-        ))
-
-    if anom_status == "ANOMALOUS":
-        db.add(Alert(
-            student_id=new_student.id,
-            alert_type="ISOLATION_FOREST_ANOMALY",
-            severity="WARNING",
-            reason=anom_reason or "Statistical anomaly in student lifestyle/academic features.",
-            status="NEW"
-        ))
-
-    if ml_class == "SUSPICIOUS":
-        db.add(Alert(
-            student_id=new_student.id,
-            alert_type="RANDOM_FOREST_SUSPICIOUS",
-            severity="CRITICAL",
-            reason=ml_reason or "Supervised classifier flagged suspicious behavioral attributes.",
-            status="NEW"
-        ))
-
-    db.commit()
-
-    # 7. Audit Trail Logging
-    log_audit(
+    result: PipelineResult = pipeline_service.process_student(
         db=db,
-        user_email=current_user.email,
-        user_role=current_user.role,
-        action="STUDENT_ENROLLED",
-        entity_type="Student",
-        entity_id=str(new_student.id),
-        details=f"Enrolled {new_student.full_name} ({new_student.apaar_id}). Validation: {val_status}, Duplicate: {dup_status}, Risk: {overall_risk}"
+        raw_data=student_dict,
+        submission_source="MANUAL",
+        current_user=current_user,
+        auto_commit=True
     )
 
-    return student_to_response(new_student)
+    return student_to_response(result.student)
 
 @router.put("/{id}", response_model=StudentResponse)
 def update_student(
     id: int,
-    student_in: StudentUpdate,
+    student_update: StudentUpdate,
     current_user: User = Depends(require_roles(["AICTE_ADMIN", "COLLEGE_ADMIN", "ADMISSION_STAFF"])),
     db: Session = Depends(get_db)
 ):
     student = db.query(Student).filter(Student.id == id).first()
     if not student:
-        raise HTTPException(status_code=404, detail="Student record not found.")
+        raise HTTPException(status_code=404, detail="Student not found.")
 
-    if current_user.role == "COLLEGE_ADMIN" and current_user.institution_id and student.institution_id != current_user.institution_id:
-        raise HTTPException(status_code=403, detail="Unauthorized modification of cross-institutional record.")
+    if current_user.role in ("COLLEGE_ADMIN", "ADMISSION_STAFF") and current_user.institution_id and student.institution_id != current_user.institution_id:
+        raise HTTPException(status_code=403, detail="Unauthorized access to cross-institutional student record.")
 
-    update_data = student_in.dict(exclude_unset=True)
-    for field, val in update_data.items():
+    update_dict = student_update.model_dump(exclude_unset=True)
+    for field, val in update_dict.items():
         setattr(student, field, val)
 
     student.updated_at = datetime.datetime.utcnow()
@@ -313,7 +235,7 @@ def update_student(
         action="STUDENT_UPDATED",
         entity_type="Student",
         entity_id=str(student.id),
-        details=f"Updated student #{student.id} ({student.full_name}). Modified fields: {list(update_data.keys())}"
+        details=f"Updated student #{student.id}: {', '.join(update_dict.keys())}"
     )
 
     return student_to_response(student)
@@ -326,13 +248,14 @@ def delete_student(
 ):
     student = db.query(Student).filter(Student.id == id).first()
     if not student:
-        raise HTTPException(status_code=404, detail="Student record not found.")
+        raise HTTPException(status_code=404, detail="Student not found.")
 
     if current_user.role == "COLLEGE_ADMIN" and current_user.institution_id and student.institution_id != current_user.institution_id:
-        raise HTTPException(status_code=403, detail="Unauthorized deletion of cross-institutional record.")
+        raise HTTPException(status_code=403, detail="Cannot delete student belonging to another institution.")
 
     student_name = student.full_name
     apaar_id = student.apaar_id
+
     db.delete(student)
     db.commit()
 
@@ -343,7 +266,7 @@ def delete_student(
         action="STUDENT_DELETED",
         entity_type="Student",
         entity_id=str(id),
-        details=f"Permanently deleted student #{id} ({student_name}, {apaar_id})"
+        details=f"Deleted student record: {student_name} ({apaar_id})"
     )
 
     return {"success": True, "message": f"Student #{id} deleted successfully."}
@@ -357,12 +280,16 @@ def verify_student(
 ):
     student = db.query(Student).filter(Student.id == id).first()
     if not student:
-        raise HTTPException(status_code=404, detail="Student record not found.")
+        raise HTTPException(status_code=404, detail="Student not found.")
 
-    student.verification_status = payload.status
-    student.verification_notes = payload.notes
+    new_status = payload.status.upper()
+    if new_status not in ["VERIFIED", "REJECTED", "FLAGGED", "PENDING"]:
+        raise HTTPException(status_code=400, detail="Invalid status. Must be VERIFIED, REJECTED, FLAGGED, or PENDING.")
+
+    student.verification_status = new_status
     student.verified_at = datetime.datetime.utcnow()
     student.verified_by = current_user.email
+    student.verification_notes = payload.notes
     student.updated_at = datetime.datetime.utcnow()
 
     db.commit()
@@ -375,8 +302,7 @@ def verify_student(
         action="STUDENT_VERIFIED",
         entity_type="Student",
         entity_id=str(student.id),
-        details=f"Updated verification status of #{student.id} to '{payload.status}'. Notes: {payload.notes or 'None'}"
+        details=f"Marked verification as {new_status} by {current_user.email}. Notes: {payload.notes or 'None'}"
     )
 
     return student_to_response(student)
-

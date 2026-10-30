@@ -9,7 +9,13 @@ import {
   MLModelStatus, 
   ComplianceReport,
   Institution,
-  UserRole
+  UserRole,
+  ProgramIntake,
+  Credential,
+  PublicVerificationResult,
+  BatchAnalysis,
+  ConfirmImportResult,
+  BatchSummary
 } from '../types';
 
 export const authApi = {
@@ -45,6 +51,28 @@ export const institutionsApi = {
   }
 };
 
+export const intakesApi = {
+  getIntakes: async (params?: { institution_id?: number; academic_year?: string }) => {
+    const res = await apiClient.get<ProgramIntake[]>('/intakes', { params });
+    return res.data;
+  },
+  createIntake: async (data: {
+    institution_id: number;
+    program_name: string;
+    academic_year?: string;
+    approved_intake: number;
+    supernumerary_seats: number;
+    intake_policy?: string;
+  }) => {
+    const res = await apiClient.post<ProgramIntake>('/intakes', data);
+    return res.data;
+  },
+  updateIntake: async (id: number, data: Partial<ProgramIntake>) => {
+    const res = await apiClient.put<ProgramIntake>(`/intakes/${id}`, data);
+    return res.data;
+  }
+};
+
 export const studentsApi = {
   getStudents: async (params?: {
     search?: string;
@@ -55,6 +83,9 @@ export const studentsApi = {
     anomaly_status?: string;
     ml_classification?: string;
     verification_status?: string;
+    admission_category?: string;
+    is_cross_institution_duplicate?: boolean;
+    is_excess_intake?: boolean;
     page?: number;
     page_size?: number;
     sort_by?: string;
@@ -91,6 +122,24 @@ export const studentsApi = {
   }
 };
 
+export const submissionsApi = {
+  submitManual: async (data: Partial<Student>) => {
+    const res = await apiClient.post<Student>('/submissions/manual', data);
+    return res.data;
+  },
+  submitApiBatch: async (records: Partial<Student>[], apiKey?: string) => {
+    const headers: Record<string, string> = {};
+    if (apiKey) headers['X-API-Key'] = apiKey;
+    const res = await apiClient.post('/submissions/api', { records }, { headers });
+    return res.data;
+  },
+  getBatches: async (method?: string) => {
+    const params = method ? { submission_method: method } : {};
+    const res = await apiClient.get<BatchSummary[]>('/submissions/batches', { params });
+    return res.data;
+  }
+};
+
 export const bulkImportApi = {
   analyzeFile: async (file: File, institutionId?: number) => {
     const formData = new FormData();
@@ -98,39 +147,70 @@ export const bulkImportApi = {
     if (institutionId) {
       formData.append('institution_id', institutionId.toString());
     }
-    const res = await apiClient.post('/bulk-import/analyze', formData, {
+    const res = await apiClient.post<BatchAnalysis>('/bulk-import/analyze', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
       timeout: 120000,
     });
     return res.data;
   },
   confirmImport: async (batchId: string, excludedRows: number[]) => {
-    const res = await apiClient.post(`/bulk-import/confirm/${batchId}`, { excluded_rows: excludedRows });
+    const res = await apiClient.post<ConfirmImportResult>(`/bulk-import/confirm/${batchId}`, { excluded_rows: excludedRows });
     return res.data;
   },
   deleteSourceFile: async (batchId: string) => {
-    const res = await apiClient.delete(`/bulk-import/${batchId}/source-file`);
+    const res = await apiClient.delete<{ success: boolean; message: string }>(`/bulk-import/${batchId}/source-file`);
     return res.data;
   },
   getBatches: async () => {
-    const res = await apiClient.get('/bulk-import/batches');
+    const res = await apiClient.get<BatchSummary[]>('/bulk-import/batches');
     return res.data;
   },
   getTemplateUrl: () => {
     return `${apiClient.defaults.baseURL}/bulk-import/template`;
   },
-  // Legacy single-phase (kept for backward compat)
   uploadFile: async (file: File, institutionId?: number) => {
     const formData = new FormData();
     formData.append('file', file);
     if (institutionId) {
       formData.append('institution_id', institutionId.toString());
     }
-    const res = await apiClient.post('/bulk-import', formData, {
+    const res = await apiClient.post<BulkImportResponse>('/bulk-import', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
     });
     return res.data;
   },
+};
+
+export const verificationApi = {
+  getPending: async (institutionId?: number) => {
+    const params = institutionId ? { institution_id: institutionId } : {};
+    const res = await apiClient.get<Student[]>('/verification/pending', { params });
+    return res.data;
+  },
+  verifyRecord: async (studentId: number, payload: { status: string; notes?: string }) => {
+    const res = await apiClient.post<Student>(`/verification/${studentId}`, payload);
+    return res.data;
+  },
+  getHistory: async () => {
+    const res = await apiClient.get<any[]>('/verification/history');
+    return res.data;
+  },
+  publicVerify: async (identifier: string) => {
+    const res = await apiClient.post<PublicVerificationResult>('/verification/public', { identifier });
+    return res.data;
+  }
+};
+
+export const credentialsApi = {
+  getCredentials: async (institutionId?: number) => {
+    const params = institutionId ? { institution_id: institutionId } : {};
+    const res = await apiClient.get<Credential[]>('/credentials', { params });
+    return res.data;
+  },
+  getStudentCredential: async (studentId: number) => {
+    const res = await apiClient.get<Credential>(`/credentials/${studentId}`);
+    return res.data;
+  }
 };
 
 export const validationApi = {
@@ -161,6 +241,7 @@ export const duplicatesApi = {
         student: Student;
         matched_student?: Student | null;
         reason: string;
+        is_cross_institution: boolean;
         created_at: string;
       }[];
       total: number;
@@ -192,6 +273,12 @@ export const reportsApi = {
   getComplianceReport: async (params?: { institution_id?: number; academic_year?: string }) => {
     const res = await apiClient.get<ComplianceReport>('/reports', { params });
     return res.data;
+  },
+  getExportCsvUrl: (institutionId?: number, academicYear?: string) => {
+    let url = `${apiClient.defaults.baseURL}/reports/export/csv?`;
+    if (institutionId) url += `institution_id=${institutionId}&`;
+    if (academicYear) url += `academic_year=${academicYear}&`;
+    return url;
   }
 };
 
@@ -219,4 +306,3 @@ export const mlApi = {
     return res.data;
   }
 };
-

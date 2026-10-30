@@ -388,7 +388,7 @@ export const StudentsPage: React.FC = () => {
                     <td className="py-3 px-4 text-right">
                       <div className="flex items-center justify-end gap-1">
                         <Link
-                          to={`/students/${student.id}`}
+                          to={`/app/students/${student.id}`}
                           className="p-1.5 text-slate-500 hover:text-blue-700 hover:bg-blue-50 rounded transition"
                           title="View Full Profile & ML Breakdown"
                         >
